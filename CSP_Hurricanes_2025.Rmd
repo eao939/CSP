@@ -1,0 +1,2299 @@
+---
+title: "CSP_Hurricanes"
+author: "euna ao"
+date: "2025-02-18"
+output: html_document
+---
+
+
+Since im using the hurdat2 data to extimate the hurricane path, I will choose to follow the dates listed on hurdat2 instead. 
+
+Workflow: 
+
+1. Reading in data
+2. Figuring out how to do in using Hurricane Harvey information only
+3. Changing the workflow into functions so I can stop hardcoding stuff
+4. Using the functions to apply on other hurricanes
+
+
+```{R, message = 'false'}
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(knitr)
+library(RPostgreSQL)
+library(RPostgres)
+library(readxl)
+library(stringi) 
+library(parallel)
+library(openxlsx)
+library(data.table) 
+library(tokenizers)
+library(sf)
+library(ggplot2)
+library(lubridate)
+library(plm)
+library(fixest)
+library(stargazer)
+library(texreg)
+library(knitr)
+library(kableExtra)
+library(writexl)
+
+
+
+```
+
+```{R}
+
+# creating the connection 
+
+db <- 'twitter_data'  #provide the name of your db
+
+host_db <- 'localhost'
+
+db_port <- '5432'  # or any other port specified by the DBA
+
+db_user <- 'postgres'  
+
+db_password <- 'eao'
+
+con <- dbConnect(RPostgres::Postgres(), dbname = db, host=host_db, port=db_port, user=db_user, password=db_password) 
+
+```
+
+# Reading in Data
+
+### handy code block to read in all necessary files (assuming already read in once)
+
+
+```{r}
+
+us_states_tweets <- readRDS("D:\\CSP\\us_filtered_states_tweets_sf.rds")
+disasters_dataset <- dbGetQuery(con, "SELECT * FROM disasters_dataset")
+raw_hurdat2 <- dbGetQuery(con, "SELECT * FROM raw_hurtdat2")
+us_hurricanes <- dbGetQuery(con, "SELECT * FROM us_hurricanes")
+USA_state_shapefile <- st_read("D:\\CSP\\shapefiles\\2023_5m\\cb_2023_us_state_5m\\cb_2023_us_state_5m.shp")
+```
+
+```{r, eval=FALSE}
+
+# you could skip these since us_states_tweets is read in already. but im keeping it here in case i want to see the intermediate results 
+
+twitter_dataset <- dbGetQuery(con, "SELECT * FROM twitter_dataset")
+us_tweets <- readRDS("D:\\CSP\\us_states_tweets_sf.rds")
+
+```
+
+
+### this is code used to read in data the first time -- ignore if already done once
+
+Data Source: https://data.mendeley.com/datasets/mw8yd7z9wc/2
+Journal Article: https://www.sciencedirect.com/science/article/pii/S0957417422008624
+
+This is the Twitter Dataset containing the tweets about climate change. 
+
+```{r, eval=FALSE}
+
+# -------------- can ignore if first block already ran-------------------
+ 
+twitter_dataset <- read_csv("D:\\Downloads\\The Climate Change Twitter Dataset.csv")
+disasters_dataset <- read_csv("D:\\Downloads\\disasters.csv")
+
+# reading in via chunks to speed up the process 
+chunk_size <- 100000  # Adjust as needed
+for (i in seq(1, nrow(twitter_dataset), by = chunk_size)) {
+  DBI::dbWriteTable(con, "twitter_dataset", twitter_dataset[i:min(i + chunk_size - 1, nrow(twitter_dataset)), ], append = TRUE, row.names = FALSE)
+}
+
+# to write to PSQL database 
+dbWriteTable(con, "disasters_dataset", disasters_dataset, overwrite = TRUE, row.names = TRUE)
+
+```
+
+
+Next, we need a shapefile for the geographical coordinates. I am using the 2023 shapefile from US Census resources. 
+
+Source: https://www.census.gov/geographies/mapping-files/time-series/geo/cartographic-boundary.html
+
+```{r, eval=FALSE}
+
+# -------------- can ignore if first block already ran-------------------
+
+#after downloading shapefile to local drive, read it in
+USA_state_shapefile <- st_read("D:\\CSP\\shapefiles\\2023_5m\\cb_2023_us_state_5m\\cb_2023_us_state_5m.shp")
+#print(USA_state_shapefile)
+```
+
+
+
+
+# Data Processing
+
+### Filter for US Tweets Only
+
+The dataset contains tweets from all around the world, although the majority are from the US. Using the shapefile imported earlier, we can overlay the shapefile with the coordinates to filter for US tweets only. 
+
+```{r, eval=FALSE}
+
+# ------------------ can skip if first block already ran --------------------
+
+
+# state shapefile should already be read in but adding this just for reference 
+#USA_state_shapefile <- st_read("D:\\CSP\\shapefiles\\2023_5m\\cb_2023_us_state_5m\\cb_2023_us_state_5m.shp")
+
+
+# takes too long doing row by row, so doing by batches of 10000 to speed it up 
+
+twitter_dataset <- na.omit(twitter_dataset[, c("lat", "lng")]) 
+
+
+
+batch_size <- 10000
+n_batches <- ceiling(nrow(twitter_dataset) / batch_size)
+
+# Initialize an empty list to store results
+results <- list()
+
+for (i in 1:n_batches) {
+  # Get the start and end indices for the batch
+  start_idx <- ((i - 1) * batch_size) + 1
+  end_idx <- min(i * batch_size, nrow(twitter_dataset))
+  
+  # Extract the batch of tweets
+  tweets_batch <- twitter_dataset[start_idx:end_idx, ]
+  
+  # Convert batch to sf and process
+  tweets_sf <- st_as_sf(tweets_batch, coords = c("lng", "lat"), crs = 4326)
+  tweets_sf <- st_transform(tweets_sf, crs = st_crs(USA_state_shapefile))
+  us_tweets_batch <- st_intersection(tweets_sf, USA_state_shapefile)
+  
+  # Append results to the list
+  results[[i]] <- us_tweets_batch
+}
+
+# Combine all the batch results
+us_tweets <- do.call(rbind, results)
+
+#btw you get this warning --> "Warning: attribute variables are assumed to be spatially constant throughout all geometries"
+
+# save as RDS file type to preserve the geometries in a SF file
+saveRDS(us_tweets, file = "D:\\CSP\\us_states_tweets_sf.rds")
+#use this to reload it back in
+
+us_tweets <- readRDS("D:\\CSP\\us_states_tweets_sf.rds")
+```
+
+
+Here are some quick snapshots of what the data looks like:
+
+```{r, eval=FALSE}
+
+
+count(us_tweets, NAME)
+
+```
+The 6 US territories were also included in the tweet data. For consistency, I'm going to filter those out. 
+
+```{r, eval=FALSE}
+
+# ------------------ can skip if first block already ran --------------------
+
+
+us_states_tweets <- us_tweets %>%
+  filter(!NAME %in% c("American Samoa", "Commonwealth of the Northern Mariana Islands", 
+                      "District of Columbia", "Guam", "Puerto Rico", 
+                      "United States Virgin Islands"))
+
+```
+
+
+
+
+### Parsing out columns for date 
+
+Also, looking ahead, I will probably want to change the time stamp column to something I can work with. 
+
+```{r, eval=FALSE}
+
+# ------------------ can skip if first block already ran --------------------
+
+
+us_states_tweets <- us_states_tweets %>%
+  mutate(
+    year = substr(created_at, 1, 4),  
+    month = substr(created_at, 6, 7), 
+    day = substr(created_at, 9, 10),
+    date = as.Date(paste(year, month, day, sep = "-"))
+
+  )
+
+```
+
+
+### saving as RDS
+
+To save the computational trouble of re-running eveyrthing above, heres the final RDS for filtered US tweets. 
+Just a note: still considered a SF file so the geometries are intact. Therefore, cannot load in PSQL and has to be saved locally. 
+
+```{r, eval=FALSE}
+
+# ------------------ can skip if first block already ran --------------------
+
+
+saveRDS(us_states_tweets, file = "D:\\CSP\\us_filtered_states_tweets_sf.rds")
+
+# use this to reload back in. also in first block for convenience 
+us_states_tweets <- readRDS("D:\\CSP\\us_filtered_states_tweets_sf.rds")
+
+```
+
+
+
+### Quick Snapshot
+
+## Exploratory Data Analysis
+
+First, some basic stats that I will need for later
+`
+Lets look at the distribution in stance between the states
+
+```{r, eval=FALSE}
+
+summary_stats <- us_states_tweets %>%
+  group_by(NAME, stance) %>%             # Group by state and stance
+  summarise(count = n()) %>%             # Count the number of each stance per state
+  mutate(total = sum(count),             # Calculate total tweets per state
+         proportion = count / total) %>% # Calculate proportion of each stance per state
+  ungroup()                              # Ungroup to prevent further grouping issues
+
+
+
+# View the result
+print(summary_stats)
+```
+
+
+
+Just looking through each group, there are a decent number of datapoints per group. The believers group is far larger but there are still a decent amount of deniers. Some groups are fall smaller, such as Delaware with a 2949/386/750 --> believer/denier/neutral composition. Those may run into some statistical testing issues with power but the rest of the points should be good. 
+
+Some areas have really disporportionate distributions. For example, New York has 201901 believer tweets, compared to 149000 deniers and 49973 neutral. However, keep in mind believer also includes this like news articles, reports, retweets of academic journals, etc. So it is natural that believer is much higher --> this will have to be clearly stated in my background and limitations. 
+
+To deal with factors related to different state attributes (ex. population, social media use, political leanings, etc), would using log help? This way we are only looking at percent changes, not the absolute amounts
+
+
+To visualize, lets try a bar graph. Im not sure a line graph would make much sense here unless I want to do it temporally. 
+
+```{r, eval=FALSE}
+ggplot(summary_stats, aes(x = NAME, y = proportion, fill = stance)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = "Proportion of Climate Change Stances by State", 
+       x = "State", 
+       
+              y = "Proportion") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) # Rotate x-axis labels
+```
+
+Now lets look at the differences in aggression and seniment, grouping by state and stance
+
+```{r, eval=FALSE}
+
+# Assuming us_tweets contains columns: NAME (state), stance, aggressiveness, and sentiment
+summary_stats_1 <- us_tweets %>%
+  group_by(NAME, stance) %>%  # Group by state and stance
+  summarise(
+    count = n(),  # Count total number of tweets in each group
+    aggressive_count = sum(aggressiveness == "aggressive", na.rm = TRUE),  # Count aggressive tweets
+    proportion_aggressive = aggressive_count / count,  # Calculate proportion of aggressive tweets
+    avg_sentiment = mean(sentiment, na.rm = TRUE)  # Calculate average sentiment
+  ) %>%
+  arrange(NAME, stance)  # Sort by state and stance
+
+ggplot(summary_stats_1, aes(x = NAME, y = proportion_aggressive, color = stance, group = stance)) +
+  geom_line() +
+  labs(title = "Proportion of Aggresiveness by State and Stance", 
+       x = "State", 
+       y = "Average Sentiment") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels
+
+ggplot(summary_stats_1, aes(x = NAME, y = avg_sentiment, color = stance, group = stance)) +
+  geom_line() +
+  labs(title = "Average Sentiment by State and Stance", 
+       x = "State", 
+       y = "Average Sentiment") + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels
+
+```
+
+
+# Hurricane Data
+
+## Filtering for US Hurricanes
+
+Technically tropical storms and hurricanes count as tropical storms. But for consistency, I will only count hurricanes that have reached the 'hurricane' designation 
+
+source: https://oceanservice.noaa.gov/facts/cyclone.html
+
+```{r, eval=FALSE}
+
+
+# ------------ skip this if first block already ran ------------------
+
+
+us_hurricanes <- disasters_dataset |>
+  filter(Country == "United States of America (the)") |>
+  filter(!is.na(`Event Name`)) |>
+  filter(`Disaster Subtype` == "Tropical cyclone") |>
+  filter(format(`start_date`, "%Y") >= 2006 & format(`start_date`, "%Y") <= 2019)
+
+dbWriteTable(con, "us_hurricanes", us_hurricanes, row.names = FALSE, overwrite = TRUE)
+
+head(us_hurricanes)
+
+```
+
+
+### Getting Hurricane Data
+
+Source: https://www.nhc.noaa.gov/data/hurdat/hurdat2-1851-2023-051124.txt
+From this: https://www.nhc.noaa.gov/data/#hurdat
+
+This is HURDATA2, a dataset containing information about North American hurricanes such as impact tracking, wind speeds, and timestamps. 
+
+
+```{r, eval=FALSE}
+
+
+# ------------ skip this if first block already ran ----------------
+
+# its an online TXT so i need to download it locally
+
+url <- "https://www.nhc.noaa.gov/data/hurdat/hurdat2-1851-2023-051124.txt"
+destfile <- "hurdat2.txt"  
+download.file(url, destfile, mode = "wb")
+
+hurdat2_txt <- read.table("C:\\Users\\eunaa\\Documents\\R Data\\hurdat2.txt") 
+
+write.csv(df, "hurdat2.csv", row.names = FALSE)
+
+```
+
+The txt file is formatted weirdly such that each set of hurricane data has a header. This means some rows have only 3 fields while the rest have 21 which messes up reading it in. 
+
+I will manually find hurricanes and filter for those 
+
+```{r, eval=FALSE}
+
+
+# --------- skip this if first block already ran -----------
+
+# Read the file as a CSV without worrying about column names or counts
+raw_hurdat2 <- read.csv("C:\\Users\\eunaa\\Documents\\R Data\\hurdat2.txt", header = FALSE, fill = TRUE, sep = ",")
+
+dbWriteTable(con, "raw_hurdat2", raw_hurdat2, overwrite = TRUE, row.names = TRUE)
+
+
+# Save it as a CSV (if needed)
+write.csv(df, "hurdat2_raw.csv", row.names = FALSE)
+
+
+#heres the path btw: "C:\Users\eunaa\Documents\R Data\hurdat2_raw.csv"
+```
+
+
+# Custom Functions
+
+### Hurricane Processing
+
+Use this to manually examine hurricanes. I am keeping this hear because the for-loop was built off these functions so it's good to keep as reference and to spot check 
+
+```{r}
+
+# this returns the hurricane path (ie. the curved path)
+
+
+get_hurricane_path <- function(start_row, end_row, hurricane_name) {
+  # Extract hurricane data from specified rows
+  hurricane_sf <- raw_hurdat2[start_row:end_row,] |> 
+    mutate(
+      V6 = ifelse(grepl("W", V6), as.numeric(gsub("W", "", V6)) * -1, as.numeric(gsub("E", "", V6))),
+      V5 = ifelse(grepl("S", V5), as.numeric(gsub("S", "", V5)) * -1, as.numeric(gsub("N", "", V5)))
+    ) |> 
+    st_as_sf(coords = c("V6", "V5"), crs = 4269)
+
+  # Identify affected states
+  affected_states <- USA_state_shapefile[st_intersects(USA_state_shapefile, hurricane_sf, sparse = FALSE), ]
+  affected_state_names <- USA_state_shapefile$NAME[unlist(affected_states)]
+
+  
+  
+  # Visualization
+  ggplot() +
+    geom_sf(data = USA_state_shapefile, fill = "gray", color = "black") +  # All states in gray
+    geom_sf(data = affected_states, fill = "red", color = "black") +  # Affected states in red
+    geom_sf(data = hurricane_sf, color = "blue", linewidth = 2) +  # Hurricane path in blue
+    theme_minimal() +
+    ggtitle(paste0("Hurricane ",hurricane_name," Path"))
+
+
+}
+
+```
+
+
+
+```{r}
+# this returns the name of the directly impacted states 
+# the results of this function feeds into the next 
+
+get_direct_states <- function(start_row, end_row) {
+# i know this was alerady done above but I can't think of another way to do this without creating one massive function 
+  hurricane_sf <- raw_hurdat2[start_row:end_row,] |>
+    mutate(
+      V6 = ifelse(grepl("W", V6), as.numeric(gsub("W", "", V6)) * -1, as.numeric(gsub("E", "", V6))),
+      V5 = ifelse(grepl("S", V5), as.numeric(gsub("S", "", V5)) * -1, as.numeric(gsub("N", "", V5)))
+    ) |>
+    st_as_sf(coords = c("V6", "V5"), crs = 4269)  # Convert to sf object
+  
+  # Spatial join to find intersecting states
+  affected_states <- st_join(hurricane_sf, USA_state_shapefile, join = st_intersects)
+  
+  # Extract unique state names
+  direct_states <- unique(affected_states$NAME)
+
+  return(direct_states)  # Return instead of print
+}
+
+
+
+```
+
+```{r}
+
+#finally this maps out the direct zones, neiguboring zones, and unimpacted zones 
+
+
+map_hurricane_impact <- function(direct_states, hurricane_name) {
+  if (length(direct_states) == 0) {
+    stop("No direct impact states found. Check the hurricane data.")
+  }
+
+  # Get SF data for directly impacted states
+  direct_states_geom <- USA_state_shapefile[USA_state_shapefile$NAME %in% direct_states, ]
+
+  # Identify adjacent states
+  adjacent_matrix <- st_touches(direct_states_geom, USA_state_shapefile, sparse = FALSE)
+
+  # Ensure it's a valid logical matrix before processing
+  if (!is.matrix(adjacent_matrix)) {
+    adjacent_states <- character(0)  # No adjacent states
+  } else {
+    adjacent_states <- unique(USA_state_shapefile$NAME[apply(adjacent_matrix, 2, any)])
+  }
+
+  # Remove direct impacted states from adjacent states
+  adjacent_states <- setdiff(adjacent_states, direct_states)
+
+  # Categorize states for visualization
+  viz_data <- USA_state_shapefile %>%
+    mutate(state_category = case_when(
+      NAME %in% direct_states ~ "Direct Impacted",
+      NAME %in% adjacent_states ~ "Adjacent",
+      TRUE ~ "Other"
+    ))
+
+  # Create the map using ggplot
+  ggplot(data = viz_data) +
+    geom_sf(aes(fill = state_category), color = "black") +  # State boundaries in black
+    scale_fill_manual(values = c("Direct Impacted" = "red", "Adjacent" = "blue", "Other" = "gray")) +
+    theme_minimal() +
+    labs(title = paste(hurricane_name, "Impact Map")) +
+    theme(legend.position = "bottom")
+}
+
+```
+
+```{r}
+
+# this is only to get the names of the direct states back 
+# if you want the map, use the next function 
+
+get_hurricane_impact <- function(direct_states, hurricane_name) {
+  if (length(direct_states) == 0) {
+    stop("No direct impact states found. Check the hurricane data.")
+  }
+
+  # Get SF data for directly impacted states
+  direct_states_geom <- USA_state_shapefile[USA_state_shapefile$NAME %in% direct_states, ]
+
+  # Identify adjacent states
+  adjacent_matrix <- st_touches(direct_states_geom, USA_state_shapefile, sparse = FALSE)
+
+  # Ensure it's a valid logical matrix before processing
+  if (!is.matrix(adjacent_matrix)) {
+    adjacent_states <- character(0)  # No adjacent states
+  } else {
+    adjacent_states <- unique(USA_state_shapefile$NAME[apply(adjacent_matrix, 2, any)])
+  }
+
+  # Remove direct impacted states from adjacent states
+  adjacent_states <- setdiff(adjacent_states, direct_states)
+
+  # Return the state groups
+  return(list(direct_states = direct_states, adjacent_states = adjacent_states))
+}
+
+```
+
+```{r}
+
+# this is if you want a visual map 
+
+map_hurricane_impact <- function(hurricane_impact, hurricane_name) {
+  if (length(direct_states) == 0) {
+    stop("No direct impact states found. Check the hurricane data.")
+  }
+
+  # Categorize states for visualization
+  viz_data <- USA_state_shapefile %>%
+    mutate(state_category = case_when(
+      NAME %in% hurricane_impact$direct_states ~ "Directly Impacted",
+      NAME %in% hurricane_impact$adjacent_states ~ "Adjacent",
+      TRUE ~ "Other"
+    ))
+
+  #Create the map using ggplot
+ ggplot(data = viz_data) +
+  geom_sf(aes(fill = state_category), color = "black") +  # State boundaries in black
+   scale_fill_manual(values = c("Directly Impacted" = "red", "Adjacent" = "blue", "Other" = "gray")) +
+    theme_minimal() +
+    labs(title = paste(hurricane_name, "Impact Map")) +
+    theme(legend.position = "bottom")
+}
+
+```
+
+
+
+### Summary Stats
+
+##### Tweet Activity
+
+```{r}
+
+# this creates a visualization of the log() of tweet activity. aka to look at parallel trends kinda 
+
+get_activity_viz <- function(hurricane_name, before, after, start_date, hurricane_impact) {
+  
+  hurricane_parallel <- us_states_tweets |>
+  filter(date < as.Date(after) & date > as.Date(before)) |>
+  mutate(treatment_group = case_when(
+      NAME %in% hurricane_impact$direct_states ~ "Direct",
+      NAME %in% hurricane_impact$adjacent_states ~ "Neighbor",
+    TRUE ~ "Un-affected" 
+  )) |>
+ group_by(date, treatment_group) |>  
+  summarise(count = log(1+ n()), n = n()) 
+
+ggplot(hurricane_parallel, aes(x = date, y = count, color = treatment_group)) +
+  geom_line(linewidth = 1) +  
+  geom_vline(xintercept = as.Date(start_date), linetype = "dashed", color = "green", linewidth = 1) +  
+  labs(title = paste("Twitter Discourse by State Group for Hurricane", hurricane_name),
+       x = "Time",
+       y = "Tweet Volume") +
+  scale_color_manual(values = c("red", "blue", "black")) +
+  theme_minimal()
+}
+```
+
+```{r}
+
+# get tweet activity means
+
+get_activity_means <- function(hurricane_name, before, after, start_date, hurricane_impact){
+  
+  hurricane_activity_means <- us_states_tweets |>
+  filter(date < as.Date(after) & date > as.Date(before)) |>  
+  mutate(treatment_group = case_when(
+      NAME %in% hurricane_impact$direct_states ~ "Direct",
+      NAME %in% hurricane_impact$adjacent_states ~ "Neighbor",
+    TRUE ~ "Un-affected" 
+    )
+  ) |>  
+  group_by(date, treatment_group) |>  
+  summarise(count = log(1 + n()), n = n()) |>
+  mutate(post_treatment = ifelse(date >= start_date, 1, 0)) |>
+  mutate(hurricane_id = hurricane_name) |>
+  mutate(start_date = start_date)
+}
+
+```
+
+```{r}
+# get tweet activity means summarize (therefore 3x2 matrix)
+# this needs the function above to feed into it 
+
+get_activity_means_summarized <- function(hurricane_name, hurricane_activity_means, start_date){
+  hurricane_activity_means_data <- sf::st_drop_geometry(hurricane_activity_means) |>
+  mutate(period = ifelse(date < as.Date(start_date), "Before", "After")) |>
+  group_by(treatment_group, period) |> 
+  summarise(mean_count = mean(count), .groups = 'drop') |>
+  pivot_wider(names_from = period, values_from = mean_count) |>
+  mutate(difference_in_means = After - Before)}
+```
+
+
+
+##### Sentiment 
+
+```{r}
+
+# this is graphing it
+
+get_sentiment_viz <- function(hurricane_name, before, after, start_date, hurricane_impact){
+    
+  hurricane_sentiment <- us_states_tweets |>
+  filter(date < as.Date(after) & date > as.Date(before)) |>
+  mutate(treatment_group = case_when(
+      NAME %in% hurricane_impact$direct_states ~ "Direct",
+      NAME %in% hurricane_impact$adjacent_states ~ "Neighbor",
+    TRUE ~ "Un-affected" 
+  )) |>
+ group_by(date, treatment_group) |>  
+  summarise(avg_sentiment = (mean(sentiment)), .groups = 'drop') 
+
+ggplot(hurricane_sentiment, aes(x = date, y = avg_sentiment, color = treatment_group)) +
+  geom_line() +  
+  geom_vline(xintercept = as.Date(start_date), linetype = "dashed", color = "green", linewidth = 1) +  
+  labs(title = "Twitter Discourse by State Group",
+       x = "Time",
+       y = "Mean Sentiment") +
+  scale_color_manual(values = c("red", "blue", "black")) +
+  theme_minimal() +
+  facet_wrap(~treatment_group, scales = "free_y")  # Creates separate plots for each group becauase its illegible when stacked together 
+}
+```
+
+```{r}
+
+# this is getting sentiment means
+
+get_sentiment_means <- function(hurricane_name, before, after, start_date, hurricane_impact){
+    hurricane_sentiment_means <- us_states_tweets |>
+  filter(date < as.Date(after) & date > as.Date(before)) |>
+  mutate(
+    treatment_group = case_when(
+      NAME %in% hurricane_impact$direct_states ~ "Direct",
+      NAME %in% hurricane_impact$adjacent_states ~ "Neighbor",
+    TRUE ~ "Un-affected" )) |>
+    group_by(date, treatment_group) |>  
+  summarise(avg_sentiment = (mean(sentiment)), .groups = 'drop') |>
+      mutate(post_treatment = ifelse(date >= start_date, 1, 0)) |>
+        mutate(hurricane_id = hurricane_name) |>
+  mutate(start_date = start_date)
+
+}
+
+
+```
+
+```{r}
+# finally this is getting the summarized 2x3 matrix
+
+get_sentiment_means_summarized <-  function(hurricane_name, hurricane_sentiment_means, start_date){
+    
+  hurricane_sentiment_means_data <- sf::st_drop_geometry(hurricane_sentiment_means) |>
+  mutate(period = ifelse(date < as.Date(start_date), "Before", "After"))|>
+  group_by(treatment_group, period) |> 
+  summarise(mean = mean(avg_sentiment), .groups = 'drop') |>
+    pivot_wider(names_from = period, values_from = mean) |>
+    mutate(difference_in_means = After - Before)
+
+}
+```
+
+##### stance
+
+```{r}
+# this is to visualize it
+
+get_stance_viz <- function(hurricane_name, before, after, start_date, hurricane_impact){
+hurricane_stance <- us_states_tweets |>
+  filter(date < as.Date(after) & date > as.Date(before)) |>
+  mutate(treatment_group = case_when(
+      NAME %in% hurricane_impact$direct_states ~ "Direct",
+      NAME %in% hurricane_impact$adjacent_states ~ "Neighbor",
+    TRUE ~ "Un-affected" 
+  )) |>
+  group_by(date, treatment_group, stance) |>  # Group by stance too!
+  summarise(count = n(), .groups = 'drop') |>  # Count tweets per stance
+  group_by(date, treatment_group) |>  
+  mutate(prop_stance = count / sum(count))  # Compute proportion within each group
+
+
+ggplot(hurricane_stance, aes(x = date, y = prop_stance, color = stance)) +
+  geom_line(linewidth = 1) +  
+  geom_vline(xintercept = as.Date(start_date), linetype = "dashed", color = "green", linewidth = 1) +  
+  labs(title = "Proportion of Climate Stance Over Time by Treatment Group",
+       x = "Date",
+       y = "Proportion of Stance",
+       color = "Stance") +
+  scale_color_manual(values = c("darkgreen", "darkred", "gray")) +  # Assign colors to stance types
+  theme_minimal() +
+  #facet_wrap(~treatment_group, scales = "free_y")  
+  facet_grid(stance ~ treatment_group, scales = "free_y")
+
+}
+```
+
+
+```{r}
+
+# getting the CSV with the means 
+
+get_stance_means <- function(hurricane_name, before, after, start_date, hurricane_impact){
+
+hurricane_stance_means <- us_states_tweets |>
+  filter(date < as.Date(after) & date > as.Date(before)) |>  
+  mutate(treatment_group = case_when(
+      NAME %in% hurricane_impact$direct_states ~ "Direct",
+      NAME %in% hurricane_impact$adjacent_states ~ "Neighbor",
+    TRUE ~ "Un-affected" 
+  )) |>  group_by(date, treatment_group, stance) |>  
+  summarise(count = n(), .groups = 'drop') |>  
+  group_by(date, treatment_group) |>  
+  mutate(prop_stance = count / sum(count)) |>  # Proportion per stance
+  ungroup() |>
+  mutate(post_treatment = ifelse(date >= start_date, 1, 0)) |>
+    mutate(hurricane_id = hurricane_name)|>
+  mutate(start_date = start_date)
+
+}
+```
+
+```{r}
+
+# summarizing the means into the 2x3 matrix 
+
+get_stance_means_summarized <-  function(hurricane_name, hurricane_stance_means, start_date){
+hurricane_stance_means_data <- sf::st_drop_geometry(hurricane_stance_means) |>
+  mutate(period = ifelse(date < as.Date(start_date), "Before", "After"))|>
+   group_by(treatment_group, stance, period) |> 
+  summarise(mean = mean(prop_stance), .groups = 'drop') |>
+    pivot_wider(names_from = period, values_from = mean) |>
+    mutate(difference_in_means = After - Before)
+}
+
+```
+
+
+
+# Hurricane Selection 
+
+To filter for hurricanes that will be used for the regression, several criteria will be used
+
+1) Hurricane must have reached HU (hurricane) designation during its lifespan 
+2) Must have made landfall some time in the US during its lifespan (aka. hurricanes that dont make it to land but still cause flooding cannot be included due to consistency issues)
+3) Must be in continental USA (ex. Hawaii cannot be included because they have no land border with another state)
+4) Cannot have another hurricane that meets prior conditions 6 months before or 6 months after
+
+
+### For-Loop Hurricane Filtering
+
+To select the hurricanes that will be included in the regression, I will use a for-loop to process through the hurdat2 csv file from US NOAA as they are a credible source and because it has accurate geographic coordinates for the hurricane path. 
+
+The for-loop will be based off of the custom functions above (ex. `get_direct_states`, `get_hurricane_impact` etc). They will have to be modelled slightly since they refer to objects internal to the loop. The logic will remain the same however. 
+
+
+```{r}
+
+#use grepl to identify the separation rows 
+hurricane_rows <- grepl("^AL", raw_hurdat2$V1)
+
+#initialize empty columns 
+raw_hurdat2$Hurricane_ID <- NA
+raw_hurdat2$Hurricane_Name <- NA
+
+raw_hurdat2$Hurricane_ID[hurricane_rows] <- trimws(raw_hurdat2$V1[hurricane_rows])  # AL012017 format
+raw_hurdat2$Hurricane_Name[hurricane_rows] <- trimws(raw_hurdat2$V2[hurricane_rows])  # Actual name like "Harvey"
+
+hurdat2 <- raw_hurdat2 %>%
+  fill(Hurricane_ID, Hurricane_Name, .direction = "down")
+
+# Remove the original hurricane header rows (they are now redundant)
+hurdat2 <- hurdat2[!hurricane_rows, ]
+
+```
+
+```{r}
+
+# drop all hurricanes that never reached hurricane status
+print(unique(hurdat2$V4))  # See all unique values in V4
+
+
+filtered_hurdat2 <- hurdat2 %>%
+  mutate(row_index = row_number()) |> # need absolute row index for later grouping 
+  group_by(Hurricane_ID) |>
+  filter(any(V4 == " HU"))|>
+  mutate(
+    start_row = min(row_index),  # First row for each Hurricane_ID
+    end_row = max(row_index),    # Last row for each Hurricane_ID
+    .groups = "drop"
+  )
+
+# also need to make a new date column - right now its a character
+
+filtered_hurdat2 <- filtered_hurdat2 |>
+    mutate(
+    year = substr(V1, 1, 4),  
+    month = substr(V1, 5, 6), 
+    day = substr(V1, 7, 8),
+    date = as.Date(paste(year, month, day, sep = "-"))
+  )
+
+
+# finally, filter for dates that our dataset actually covers
+
+filtered_hurdat2 <- filtered_hurdat2 |>
+  group_by(Hurricane_ID) |>
+  filter(date > as.Date("2006-06-09") & date < as.Date("2020-01-01")) 
+
+
+  
+```
+
+Again, these custom functions are here again because they have to be slightly modified to be compatible with a for loop. To differentiate, I will denote them with an "F"
+
+```{r}
+
+# this returns the hurricane path (ie. the curved path)
+
+
+fget_hurricane_path <- function(start_row, end_row, hurricane_name) {
+  # Extract hurricane data from specified rows
+  hurricane_sf <- hurricane_data[start_row:end_row,] |> 
+    mutate(
+      V6 = ifelse(grepl("W", V6), as.numeric(gsub("W", "", V6)) * -1, as.numeric(gsub("E", "", V6))),
+      V5 = ifelse(grepl("S", V5), as.numeric(gsub("S", "", V5)) * -1, as.numeric(gsub("N", "", V5)))
+    ) |> 
+    st_as_sf(coords = c("V6", "V5"), crs = 4269)
+
+  # Identify affected states
+  affected_states <- USA_state_shapefile[st_intersects(USA_state_shapefile, hurricane_sf, sparse = FALSE), ]
+  affected_state_names <- USA_state_shapefile$NAME[unlist(affected_states)]
+
+  
+  
+  # Visualization
+  ggplot() +
+    geom_sf(data = USA_state_shapefile, fill = "gray", color = "black") +  # All states in gray
+    geom_sf(data = affected_states, fill = "red", color = "black") +  # Affected states in red
+    geom_sf(data = hurricane_sf, color = "blue", linewidth = 2) +  # Hurricane path in blue
+    theme_minimal() +
+    ggtitle(paste0("Hurricane ",hurricane_name," Path"))
+}
+
+
+
+# this is to get the direct_states
+fget_direct_states <- function(start_row, end_row) {
+  
+  hurricane_sf <- hurricane_data[start_row:end_row,] |>
+    mutate(
+      V6 = ifelse(grepl("W", V6), as.numeric(gsub("W", "", V6)) * -1, as.numeric(gsub("E", "", V6))),
+      V5 = ifelse(grepl("S", V5), as.numeric(gsub("S", "", V5)) * -1, as.numeric(gsub("N", "", V5)))
+    ) |>
+    st_as_sf(coords = c("V6", "V5"), crs = 4269)  # Convert to sf object
+  
+  # Spatial join to find intersecting states
+  affected_states <- st_join(hurricane_sf, USA_state_shapefile, join = st_intersects)
+  
+  # Extract unique state names
+  direct_states <- unique(affected_states$NAME)
+
+  return(direct_states)  # Return instead of print
+}
+
+
+
+# this will distinguish the neighbors and unaffected
+
+fget_hurricane_impact <- function(direct_states, hurricane_name) {
+  if (length(direct_states) == 0) {
+    stop("No direct impact states found. Check the hurricane data.")
+  }
+
+  # Get SF data for directly impacted states
+  direct_states_geom <- USA_state_shapefile[USA_state_shapefile$NAME %in% direct_states, ]
+
+  # Identify adjacent states
+  adjacent_matrix <- st_touches(direct_states_geom, USA_state_shapefile, sparse = FALSE)
+
+  # Ensure it's a valid logical matrix before processing
+  if (!is.matrix(adjacent_matrix)) {
+    adjacent_states <- character(0)  # No adjacent states
+  } else {
+    adjacent_states <- unique(USA_state_shapefile$NAME[apply(adjacent_matrix, 2, any)])
+  }
+
+  # Remove direct impacted states from adjacent states
+  adjacent_states <- setdiff(adjacent_states, direct_states)
+
+  # Return the state groups
+  return(list(direct_states = direct_states, adjacent_states = adjacent_states))
+}
+      
+```
+
+
+
+```{r}
+
+#this is the actual loop to run 
+
+hurricane_row_indices <- filtered_hurdat2 %>%
+  select(Hurricane_ID) |>
+  unique()
+
+
+hurricane_results <- list()
+
+for (hurricane_id in hurricane_row_indices[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  
+  # Get directly impacted states
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  
+  # Get neighboring states
+  adjacent_states <- fget_hurricane_impact(direct_states)
+  
+  # Store results in a dataframe row
+  hurricane_results[[hurricane_id]] <- data.frame(
+    Hurricane_ID = hurricane_id,
+    Hurricane_Name = hurricane_name,
+    direct_states = paste(adjacent_states$direct_states, collapse = "; "),
+    adjacent_states = paste(adjacent_states$adjacent_states, collapse = "; "),
+    start_date = as.Date(min(hurricane_data$date)) 
+      
+  )
+}
+
+
+
+
+
+# Combine into a single dataframe
+hurricane_impact_df <- bind_rows(hurricane_results)
+
+
+```
+
+```{r}
+# now that it only has 1 hurricane per row, add the thresholds for the diff in diff 
+
+hurricane_impact_df$before_6 <- hurricane_impact_df[[5]] %m-% months(6)
+hurricane_impact_df$after_6 <- hurricane_impact_df[[5]] %m+% months(6)
+hurricane_impact_df$before_3 <- hurricane_impact_df[[5]] %m-% months(3)
+hurricane_impact_df$after_3 <- hurricane_impact_df[[5]] %m+% months(3)
+hurricane_impact_df$before_1 <- hurricane_impact_df[[5]] %m-% months(1)
+hurricane_impact_df$after_1 <- hurricane_impact_df[[5]] %m+% months(1)
+hurricane_impact_df$before_0.5<- hurricane_impact_df[[5]] %m-% days(14)
+hurricane_impact_df$after_0.5 <- hurricane_impact_df[[5]] %m+% days(14)
+
+
+```
+
+### Selecting the Hurricanes
+
+Based on my 3 criteria, the hurricane_impact_df needs to be filtered more 
+
+1) needs to make landfall
+2) needs US state neighbors --> and therefore needs to be in continental USA
+
+Both can be done by just filtering out columns that have no adjacent neighbors
+
+```{r}
+
+hurricane_impact_df <- hurricane_impact_df |>
+  filter(adjacent_states != "")
+```
+
+From the 17 remaining hurricanes, there a few that need to be taken out
+
+1) Hurricane Ike & Hurricane Gustav --> both directly travelled across Missouri in 2008
+2) Hurricane Harvey & Hurricane Irma & Hurricane Nate --> they directly travelled across Tennessee in 2017 within a 6 month period
+3) Hurricane Florence & Michael --> Travelled across South Carolina and North Carolina in 2018 within 6 months of each other 
+
+```{r}
+
+hurricane_impact_filtered <- hurricane_impact_df |>
+  filter(!Hurricane_Name %in% c("ERNESTO", "IKE", "GUSTAV", "HARVEY", "IRMA", "NATE", "FLORENCE", 
+ "MICHAEL", "BARRY"))
+
+
+# ernesto has to be removed - theres only like 1 datapoint through the entire 6 month period 
+
+#hurricane_impact_filtered <- hurricane_impact_df |>  filter(!Hurricane_Name %in% c("ERNESTO"))
+  
+```
+
+# Data Processing
+
+With the hurricanes selected, time to run the analysis on all of them.
+
+
+First, since the selection criteria was based on 6 months, the diff in diff will also have time chunks of 6 months. The start of the observation period and end of the period will have to be coded in 
+
+
+
+### Tweet Activity
+
+
+##### Activity Viz 
+```{r}
+
+# we have to use get_direct_states and get_hurricane_impact again because of the way the functions were written
+
+### this is for 6 months. not saved as an object, just visual inspection
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+# Extract values from that first row
+  start_date <- hurricane_info$start_date  # ✅ Column 32
+  before <- hurricane_info$before_6  # ✅ Column 34
+  after <- hurricane_info$after_6  # ✅ Column 33
+
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+
+  # Feed results into get_hurricane_impact
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  # Use the get_activity_viz function
+  print(get_activity_viz(hurricane_name, before, after, start_date, get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))))
+  
+}
+
+
+```
+
+
+##### Activity Means 
+
+Will need to run this 3 times - one for 6 month, one for 3 month, then one for 1 month 
+
+```{r}
+
+# for 6 months 
+
+six_hurricane_activity_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_6  
+  after <- hurricane_info$after_6  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_activity_means <- get_activity_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  six_hurricane_activity_means <- bind_rows(six_hurricane_activity_means, hurricane_activity_means)
+
+  #just visually check activity_means_summarized
+    print(get_activity_means_summarized(hurricane_name, hurricane_activity_means, start_date))
+}
+```
+```{R}
+# for 3  months 
+
+three_hurricane_activity_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_3  
+  after <- hurricane_info$after_3  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_activity_means <- get_activity_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  three_hurricane_activity_means <- bind_rows(three_hurricane_activity_means, hurricane_activity_means)
+
+  #just visually check activity_means_summarized
+    print(get_activity_means_summarized(hurricane_name, hurricane_activity_means, start_date))
+}
+```
+
+
+```{R}
+# for 1 month
+
+one_hurricane_activity_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_1  
+  after <- hurricane_info$after_1  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_activity_means <- get_activity_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  one_hurricane_activity_means <- bind_rows(one_hurricane_activity_means, hurricane_activity_means)
+
+  #just visually check activity_means_summarized
+    print(get_activity_means_summarized(hurricane_name, hurricane_activity_means, start_date))
+}
+```
+
+
+```{R}
+# for 2 weeks
+
+twoweeks_hurricane_activity_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_0.5
+  after <- hurricane_info$after_0.5  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_activity_means <- get_activity_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  twoweeks_hurricane_activity_means <- bind_rows(twoweeks_hurricane_activity_means, hurricane_activity_means)
+
+  #just visually check activity_means_summarized
+ #   print(get_activity_means_summarized(hurricane_name, hurricane_activity_means, start_date)) #some hurricanes dont have datapoints within 10 days so im gonna just skip this 
+  
+  
+  
+}
+```
+
+```{r}
+ggplot(one_hurricane_activity_means, aes(x = treatment_group, y = count)) +
+   geom_boxplot() +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.8, color = "red", fatten = 1) +
+  stat_summary(
+    fun = mean,
+    geom = "text",
+    aes(label = round(after_stat(y), 2)),
+    vjust = -0.7,  # Move the label slightly above the box
+    color = "red",
+    size = 3
+  ) +
+  facet_wrap(~ post_treatment, labeller = labeller(post_treatment = c(`0` = "Pre-Hurricane", `1` = "Post-Hurricane"))) + 
+  labs(title = "Hurricane Activity Mean - 1 Month") +
+    theme(plot.title = element_text(hjust = 0.5)) 
+ 
+# + theme_minimal()
+```
+
+
+### Sentiment 
+
+
+##### Sentiment Viz 
+
+
+
+```{r}
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+# Extract values from that first row
+  start_date <- hurricane_info$start_date  # ✅ Column 32
+  before <- hurricane_info$before_6  # ✅ Column 34
+  after <- hurricane_info$after_6  # ✅ Column 33
+
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+
+  # Feed results into get_hurricane_impact
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  # Use the get_activity_viz function
+  print(get_sentiment_viz(hurricane_name, before, after, start_date, get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))))
+  
+}
+
+
+```
+
+
+
+```{r}
+#sentiment means - 6 months
+
+six_hurricane_sentiment_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  geometry = st_sfc(),  
+  avg_sentiment = numeric(),
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_6  
+  after <- hurricane_info$after_6  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_sentiment_means <- get_sentiment_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  six_hurricane_sentiment_means <- bind_rows(six_hurricane_sentiment_means, hurricane_sentiment_means)
+
+  #just visually check activity_means_summarized
+    print(get_sentiment_means_summarized(hurricane_name, hurricane_sentiment_means, start_date))
+}
+
+```
+
+
+
+
+```{r}
+#sentiment means - 3 months
+
+three_hurricane_sentiment_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_3  
+  after <- hurricane_info$after_3  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_sentiment_means <- get_sentiment_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  three_hurricane_sentiment_means <- bind_rows(three_hurricane_sentiment_means, hurricane_sentiment_means)
+
+  #just visually check activity_means_summarized
+    print(get_sentiment_means_summarized(hurricane_name, hurricane_sentiment_means, start_date))
+}
+
+```
+
+```{r}
+#sentiment means - 1 months
+
+one_hurricane_sentiment_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_1  
+  after <- hurricane_info$after_1  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_sentiment_means <- get_sentiment_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  one_hurricane_sentiment_means <- bind_rows(one_hurricane_sentiment_means, hurricane_sentiment_means)
+
+  #just visually check activity_means_summarized
+    print(get_sentiment_means_summarized(hurricane_name, hurricane_sentiment_means, start_date))
+}
+
+```
+
+```{r}
+#sentiment means - two weeks
+
+twoweeks_hurricane_sentiment_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_0.5  
+  after <- hurricane_info$after_0.5  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_sentiment_means <- get_sentiment_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  twoweeks_hurricane_sentiment_means <- bind_rows(twoweeks_hurricane_sentiment_means, hurricane_sentiment_means)
+
+  #just visually check activity_means_summarized
+ #   print(get_sentiment_means_summarized(hurricane_name, hurricane_sentiment_means, start_date))
+}
+
+```
+
+```{r}
+ggplot(one_hurricane_sentiment_means, aes(x = treatment_group, y = avg_sentiment)) +
+   geom_boxplot() +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.8, color = "red", fatten = 1) +
+  stat_summary(
+    fun = mean,
+    geom = "text",
+    aes(label = round(after_stat(y), 2)),
+    vjust = -0.7,  # Move the label slightly above the box
+    color = "red",
+    size = 3
+  ) +
+  facet_wrap(~ post_treatment, labeller = labeller(post_treatment = c(`0` = "Pre-Hurricane", `1` = "Post-Hurricane"))) + 
+  labs(title = "Hurricane Sentiment Mean - 1 Month") +
+    theme(plot.title = element_text(hjust = 0.5)) 
+ 
+# + theme_minimal()
+```
+
+### Stance
+
+```{r}
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+# Extract values from that first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_6  
+  after <- hurricane_info$after_6  
+
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+
+  # Feed results into get_hurricane_impact
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  # Use the get_activity_viz function
+  print(get_stance_viz(hurricane_name, before, after, start_date, get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))))
+  
+}
+
+
+```
+
+
+```{r}
+#stance means - 6 months
+
+six_hurricane_stance_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_6  
+  after <- hurricane_info$after_6  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_stance_means <- get_stance_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  six_hurricane_stance_means <- bind_rows(six_hurricane_stance_means, hurricane_stance_means)
+
+  #just visually check activity_means_summarized
+    print(get_stance_means_summarized(hurricane_name, hurricane_stance_means, start_date))
+}
+
+```
+
+```{r}
+#stance means - 3 months
+
+three_hurricane_stance_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character(),
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_3  
+  after <- hurricane_info$after_3  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_stance_means <- get_stance_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  three_hurricane_stance_means <- bind_rows(three_hurricane_stance_means, hurricane_stance_means)
+
+  #just visually check activity_means_summarized
+    print(get_stance_means_summarized(hurricane_name, hurricane_stance_means, start_date))
+}
+
+```
+
+```{r}
+#stance means - 1 months
+
+one_hurricane_stance_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  hurricane_id = character()) |>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_1  
+  after <- hurricane_info$after_1  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_stance_means <- get_stance_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  one_hurricane_stance_means <- bind_rows(one_hurricane_stance_means, hurricane_stance_means)
+
+  #just visually check activity_means_summarized
+    print(get_stance_means_summarized(hurricane_name, hurricane_stance_means, start_date))
+}
+
+```
+
+
+```{r}
+#stance means - 2 weeks
+
+twoweeks_hurricane_stance_means <- tibble::tibble(
+  date = as.Date(character()),  
+  treatment_group = character(),  
+  count = numeric(),
+  geometry = st_sfc(),  
+  post_treatment = numeric(),  
+  start_date = as.Date(character()))|>
+  mutate(geometry = st_set_crs(geometry, 4269))
+
+
+
+for (hurricane_id in hurricane_impact_filtered[[1]]) {
+  hurricane_data <- filtered_hurdat2 %>% filter(Hurricane_ID == hurricane_id)
+  hurricane_name <- unique(hurricane_data$Hurricane_Name)
+  
+  hurricane_info <- hurricane_impact_filtered |> filter(Hurricane_ID == hurricane_id)  
+
+  # Extract values from the first row
+  start_date <- hurricane_info$start_date  
+  before <- hurricane_info$before_0.5 
+  after <- hurricane_info$after_0.5  
+
+  #mapping hurricane impact
+  direct_states <- fget_direct_states(1, nrow(hurricane_data))
+  hurricane_impact <- get_hurricane_impact(fget_direct_states(1, nrow(hurricane_data)))
+
+  #run get_activity_means
+  hurricane_stance_means <- get_stance_means(hurricane_name, before, after, start_date, hurricane_impact)
+
+  # Append each loop's result to the combined dataframe
+  twoweeks_hurricane_stance_means <- bind_rows(twoweeks_hurricane_stance_means, hurricane_stance_means)
+
+  #just visually check activity_means_summarized
+#   print(get_stance_means_summarized(hurricane_name, hurricane_stance_means, start_date))
+}
+
+```
+
+```{r}
+
+ggplot(one_hurricane_stance_means %>% filter(stance == "believer"), 
+       aes(x = treatment_group, y = prop_stance)) +
+  geom_boxplot() +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.7, color = "red") +
+  stat_summary(
+    fun = mean,
+    geom = "text",
+    aes(label = round(after_stat(y), 2)),
+    vjust = -0.7,
+    color = "red",
+    size = 3
+  ) +
+  facet_wrap(~ post_treatment, 
+             labeller = labeller(post_treatment = c(`0` = "Pre-Hurricane", `1` = "Post-Hurricane"))) +
+  labs(title = "Proportion of Believers by Treatment Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+ggplot(one_hurricane_stance_means %>% filter(stance == "denier"), 
+       aes(x = treatment_group, y = prop_stance)) +
+  geom_boxplot() +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.7, color = "red") +
+  stat_summary(
+    fun = mean,
+    geom = "text",
+    aes(label = round(after_stat(y), 2)),
+    vjust = -0.7,
+    color = "red",
+    size = 3
+  ) +
+  facet_wrap(~ post_treatment, 
+             labeller = labeller(post_treatment = c(`0` = "Pre-Hurricane", `1` = "Post-Hurricane"))) +
+  labs(title = "Proportion of Deniers by Treatment Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(one_hurricane_stance_means %>% filter(stance == "neutral"), 
+       aes(x = treatment_group, y = prop_stance)) +
+  geom_boxplot() +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.7, color = "red") +
+  stat_summary(
+    fun = mean,
+    geom = "text",
+    aes(label = round(after_stat(y), 2)),
+    vjust = -0.7,
+    color = "red",
+    size = 3
+  ) +
+  facet_wrap(~ post_treatment, 
+             labeller = labeller(post_treatment = c(`0` = "Pre-Hurricane", `1` = "Post-Hurricane"))) +
+  labs(title = "Proportion of Neutral by Treatment Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+
+```
+
+
+### Final Diff in Dff Visualization 
+
+Going to be using the 6 months time period 
+
+```{r}
+activity_time_since <- six_hurricane_activity_means %>%
+  mutate(time_since_hurricane = as.numeric(date - start_date)) 
+
+ ggplot(activity_time_since, aes(x = time_since_hurricane, y = count, color = treatment_group)) +
+  geom_line(alpha = 0.7, linewidth = 0.5) +  
+  geom_smooth(se = FALSE, method = "gam", formula = y ~ s(x, bs = "cs"), linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "green", linewidth = 1) +  
+  labs(title = "Tweet Activity Over Time (Relative to Hurricane)",
+       x = "Days Since Hurricane",
+       y = "Tweet Count") +
+  scale_color_manual(values = c("red", "blue", "black")) +  
+  theme_minimal() +
+  facet_grid(rows = vars(treatment_group), scales = "free_y")  # Stack plots in rows
+
+#ggsave("D:\\CSP\\Viz\\all_hurricanes_activity.pdf", plot, width = 8, height = 6)
+
+
+
+```
+
+```{r}
+sentiment_time_since <- six_hurricane_sentiment_means %>%
+  mutate(time_since_hurricane = as.numeric(date - start_date)) 
+
+ggplot(sentiment_time_since, aes(x = time_since_hurricane, y = avg_sentiment, color = treatment_group)) +
+  geom_line(linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "green", linewidth = 1) +  
+  labs(title = "Tweet Sentiment Over Time (Relative to Hurricane)",
+       x = "Days Since Hurricane",
+       y = "Average Sentiment Score") +
+  scale_color_manual(values = c("red", "blue", "black")) +  
+  theme_minimal() +
+  facet_grid(rows = vars(treatment_group), scales = "free_y")
+
+ggsave("D:\\CSP\\Viz\\all_hurricanes_sentiment.jpeg", width = 8, height = 6)
+
+```
+
+```{r}
+stance_time_since <- six_hurricane_stance_means %>%
+  mutate(time_since_hurricane = as.numeric(date - start_date)) 
+
+unique_treatment_groups <- stance_time_since %>%
+  distinct(treatment_group) %>% 
+  pull(treatment_group)  # Get unique treatment groups
+
+for (tg in unique_treatment_groups) {
+  # Filter data for the current treatment group
+  plot_data <- stance_time_since %>%
+    filter(treatment_group == tg)
+  
+  # Create the plot with 3 stances per treatment group
+  p <- ggplot(plot_data, aes(x = time_since_hurricane, y = prop_stance, color = stance)) +
+    geom_line(linewidth = 0.5) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "green", linewidth = 1) +  
+    labs(title = paste("Tweet Stance Over Time (", tg, ")", sep = ""),
+         x = "Days Since Hurricane",
+         y = "Proportion of Tweet Stance") +
+    scale_color_manual(values = c("red", "blue", "black")) +  
+    theme_minimal() +
+  #  facet_wrap(~ stance, scales = "free_y") 
+    facet_grid(rows = vars(stance), scales = "free_y")
+
+  ggsave(filename = paste0("D:\\CSP\\Viz\\all_hurricanes_stance_plot_", tg, ".jpeg"), plot = p, width = 8, height = 6, dpi = 300)
+
+  print(p)}
+
+```
+
+
+
+
+
+# Doing The Regression
+
+### compiling the CSV files together
+
+If you process more hurricanes, don't forget to add here 
+
+```{r}
+# fixing up the df's to make them fit a regression 
+# its more work to make this a loop. do it manually 
+
+
+# Activity Means 
+
+six_hurricane_activity_means$treatment_group <- factor(six_hurricane_activity_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+six_hurricane_activity_means <- six_hurricane_activity_means |>
+   mutate(six_hurricane_activity_means, year = as.factor(substr(date, 1, 4)))
+
+three_hurricane_activity_means$treatment_group <- factor(three_hurricane_activity_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+three_hurricane_activity_means <- three_hurricane_activity_means |>
+   mutate(three_hurricane_activity_means, year = as.factor(substr(date, 1, 4)))
+
+one_hurricane_activity_means$treatment_group <- factor(one_hurricane_activity_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+one_hurricane_activity_means <- one_hurricane_activity_means |>
+   mutate(one_hurricane_activity_means, year = as.factor(substr(date, 1, 4)))
+
+twoweeks_hurricane_activity_means$treatment_group <- factor(twoweeks_hurricane_activity_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+twoweeks_hurricane_activity_means <- twoweeks_hurricane_activity_means |>
+   mutate(twoweeks_hurricane_activity_means, year = as.factor(substr(date, 1, 4)))
+
+
+# Sentiment Means 
+
+six_hurricane_sentiment_means$treatment_group <- factor(six_hurricane_sentiment_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+six_hurricane_sentiment_means <- (mutate(six_hurricane_sentiment_means, year = as.factor(substr(date, 1, 4))))
+
+three_hurricane_sentiment_means$treatment_group <- factor(three_hurricane_sentiment_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+three_hurricane_sentiment_means <- (mutate(three_hurricane_sentiment_means, year = as.factor(substr(date, 1, 4))))
+
+one_hurricane_sentiment_means$treatment_group <- factor(one_hurricane_sentiment_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+one_hurricane_sentiment_means <- (mutate(one_hurricane_sentiment_means, year = as.factor(substr(date, 1, 4))))
+
+twoweeks_hurricane_sentiment_means$treatment_group <- factor(twoweeks_hurricane_sentiment_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct"))
+twoweeks_hurricane_sentiment_means <- (mutate(twoweeks_hurricane_sentiment_means, year = as.factor(substr(date, 1, 4))))
+
+
+# Stance Means
+
+
+six_hurricane_stance_means$treatment_group <- factor(six_hurricane_stance_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct")) 
+six_hurricane_stance_means$stance <- factor(six_hurricane_stance_means$stance, levels = c("neutral", "believer", "denier"))
+six_hurricane_stance_means <- (mutate(six_hurricane_stance_means, year = as.factor(substr(date, 1, 4))))
+
+three_hurricane_stance_means$treatment_group <- factor(three_hurricane_stance_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct")) 
+three_hurricane_stance_means$stance <- factor(three_hurricane_stance_means$stance, levels = c("neutral", "believer", "denier"))
+three_hurricane_stance_means <- (mutate(three_hurricane_stance_means, year = as.factor(substr(date, 1, 4))))
+
+one_hurricane_stance_means$treatment_group <- factor(one_hurricane_stance_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct")) 
+one_hurricane_stance_means$stance <- factor(one_hurricane_stance_means$stance, levels = c("neutral", "believer", "denier"))
+one_hurricane_stance_means <- (mutate(one_hurricane_stance_means, year = as.factor(substr(date, 1, 4))))
+
+twoweeks_hurricane_stance_means$treatment_group <- factor(twoweeks_hurricane_stance_means$treatment_group, levels = c("Un-affected", "Neighbor", "Direct")) 
+twoweeks_hurricane_stance_means$stance <- factor(twoweeks_hurricane_stance_means$stance, levels = c("neutral", "believer", "denier"))
+twoweeks_hurricane_stance_means <- (mutate(twoweeks_hurricane_stance_means, year = as.factor(substr(date, 1, 4))))
+
+```
+
+### 3 Period Comparison - Fixed Effects Hurricane 
+
+```{r}
+
+activity_list_3 <- c("six_hurricane_activity_means", "three_hurricane_activity_means", "one_hurricane_activity_means")
+
+feols_activity_means_3 <- list()
+
+for (i in seq_along(activity_list_3)) {
+  df_name <-activity_list_3[i]
+  feols_activity_means_3[[i]] <- feols(count ~ post_treatment * treatment_group | hurricane_id, data = get(df_name))
+  
+print(summary(feols(count ~ post_treatment * treatment_group | hurricane_id, data = get(df_name))))
+}
+
+names(feols_activity_means_3) <- activity_list_3 
+
+
+```
+
+```{r}
+
+# for sentiment 
+
+sentiment_list_3 <- c("six_hurricane_sentiment_means", "three_hurricane_sentiment_means", "one_hurricane_sentiment_means")
+
+feols_sentiment_means_3 <- list()
+
+for (i in seq_along(activity_list_3)) {
+  df_name <-sentiment_list_3[i]
+  feols_sentiment_means_3[[i]] <- feols(avg_sentiment ~ post_treatment * treatment_group | hurricane_id, data = get(df_name))
+  
+print(summary(feols(avg_sentiment ~ post_treatment * treatment_group, data = get(df_name))))
+
+}
+
+names(feols_sentiment_means_3) <- sentiment_list_3 
+
+
+```
+
+```{r}
+
+# for stance 
+
+stance_list_3 <- c("six_hurricane_stance_means", "three_hurricane_stance_means", "one_hurricane_stance_means")
+
+feols_stance_means_3 <- list()
+
+for (i in seq_along(activity_list_3)) {
+  df_name <-stance_list_3[i]
+  feols_stance_means_3[[i]] <- feols(prop_stance ~ post_treatment * treatment_group * stance | hurricane_id, data = get(df_name))
+  
+print(summary(feols(prop_stance ~ post_treatment * treatment_group * stance, data = get(df_name))))
+
+}
+
+names(feols_stance_means_3) <- stance_list_3 
+
+
+```
+
+```{r}
+
+# Full Model
+
+
+texreg(feols_activity_means_3, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month"),
+      #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Activity Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\full_631_activity.tex")
+
+
+texreg(feols_sentiment_means_3, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Sentiment Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\full_631_sentiment.tex")
+
+
+texreg(feols_stance_means_3, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Stance Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\full_631_stance.tex")
+
+
+
+#Filtered (only coefficients of interest)
+
+texreg(feols_activity_means_3, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month"),
+      #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Activity Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\filtered_631_activity.tex",
+       custom.coef.map = list( "post_treatment:treatment_groupNeighbor" = "post_treatment:treatment_groupNeighbor",
+                "post_treatment:treatment_groupDirect" = "post_treatment:treatment_groupDirect"))
+
+
+texreg(feols_sentiment_means_3, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Sentiment Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\filtered_631_sentiment.tex",
+       custom.coef.map =list("post_treatment:treatment_groupNeighbor" = "post_treatment:treatment_groupNeighbor",
+                      "post_treatment:treatment_groupDirect" = "post_treatment:treatment_groupDirect"))
+
+
+texreg(feols_stance_means_3, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Stance Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\filtered_631_stance.tex",
+       custom.coef.map =list("post_treatment:treatment_groupNeighbor:stancebeliever" = "post_treatment:treatment_groupNeighbor:stancebeliever",
+                      "post_treatment:treatment_groupDirect:stancebeliever" = "post_treatment:treatment_groupDirect:stancebeliever",
+                      "post_treatment:treatment_groupNeighbor:stancedenier" = "post_treatment:treatment_groupNeighbor:stancedenier",
+                      "post_treatment:treatment_groupDirect:stancedenier" = "post_treatment:treatment_groupDirect:stancedenier"))
+
+
+```
+
+
+#### 4 Model (same as above but 10 days included)
+### 3 Period Comparison - Fixed Effects Hurricane 
+
+```{r}
+
+activity_list_4 <- c("six_hurricane_activity_means", "three_hurricane_activity_means", "one_hurricane_activity_means", "twoweeks_hurricane_activity_means")
+
+feols_activity_means_4 <- list()
+
+for (i in seq_along(activity_list_4)) {
+  df_name <-activity_list_4[i]
+  feols_activity_means_4[[i]] <- feols(count ~ post_treatment * treatment_group | hurricane_id, data = get(df_name))
+  
+print(summary(feols(count ~ post_treatment * treatment_group | hurricane_id, data = get(df_name))))
+}
+
+names(feols_activity_means_4) <- activity_list_4 
+
+
+```
+
+```{r}
+
+# for sentiment 
+
+sentiment_list_4 <- c("six_hurricane_sentiment_means", "three_hurricane_sentiment_means", "one_hurricane_sentiment_means", "twoweeks_hurricane_sentiment_means")
+
+feols_sentiment_means_4 <- list()
+
+for (i in seq_along(activity_list_4)) {
+  df_name <-sentiment_list_4[i]
+  feols_sentiment_means_4[[i]] <- feols(avg_sentiment ~ post_treatment * treatment_group | hurricane_id, data = get(df_name))
+  
+print(summary(feols(avg_sentiment ~ post_treatment * treatment_group, data = get(df_name))))
+
+}
+
+names(feols_sentiment_means_4) <- sentiment_list_4 
+
+
+```
+
+```{r}
+
+# for stance 
+
+stance_list_4 <- c("six_hurricane_stance_means", "three_hurricane_stance_means", "one_hurricane_stance_means", "twoweeks_hurricane_stance_means")
+
+feols_stance_means_4 <- list()
+
+for (i in seq_along(activity_list_4)) {
+  df_name <-stance_list_4[i]
+  feols_stance_means_4[[i]] <- feols(prop_stance ~ post_treatment * treatment_group * stance | hurricane_id, data = get(df_name))
+  
+print(summary(feols(prop_stance ~ post_treatment * treatment_group * stance, data = get(df_name))))
+
+}
+
+names(feols_stance_means_4) <- stance_list_4 
+
+
+```
+
+```{r}
+
+# Full Model
+
+
+texreg(feols_activity_means_4, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month", "10 Days"),
+      #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Activity Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\full_631.5_activity.tex")
+
+
+texreg(feols_sentiment_means_4, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month", "10 Days"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Sentiment Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\full_631.5_sentiment.tex")
+
+
+texreg(feols_stance_means_4, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month", "10 Days"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Stance Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\full_631.5_stance.tex")
+
+
+
+#Filtered (only coefficients of interest)
+
+texreg(feols_activity_means_4, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month", "10 Days"),
+      #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Activity Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\filtered_631.5_activity.tex",
+       custom.coef.map = list( "post_treatment:treatment_groupNeighbor" = "post_treatment:treatment_groupNeighbor",
+                "post_treatment:treatment_groupDirect" = "post_treatment:treatment_groupDirect"))
+
+
+texreg(feols_sentiment_means_4, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month", "10 Days"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Sentiment Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\filtered_631.5_sentiment.tex",
+       custom.coef.map =list("post_treatment:treatment_groupNeighbor" = "post_treatment:treatment_groupNeighbor",
+                      "post_treatment:treatment_groupDirect" = "post_treatment:treatment_groupDirect"))
+
+
+texreg(feols_stance_means_4, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month", "10 Days"),
+       #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Stance Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\filtered_631.5_stance.tex",
+       custom.coef.map =list("post_treatment:treatment_groupNeighbor:stancebeliever" = "post_treatment:treatment_groupNeighbor:stancebeliever",
+                      "post_treatment:treatment_groupDirect:stancebeliever" = "post_treatment:treatment_groupDirect:stancebeliever",
+                      "post_treatment:treatment_groupNeighbor:stancedenier" = "post_treatment:treatment_groupNeighbor:stancedenier",
+                      "post_treatment:treatment_groupDirect:stancedenier" = "post_treatment:treatment_groupDirect:stancedenier"))
+
+
+```
+
+# Visualiations for Paper
+
+Below is some code to generate figures and tables for the paper 
+
+```{r, eval = FALSE}
+
+#this is for the paper to show distribution per state and distribution per year 
+
+state_counts <- count(us_states_tweets, NAME)
+year_counts <- count(us_states_tweets, year)
+
+view(state_counts)
+view(year_counts)
+
+write.csv(state_counts, "state_counts.csv", row.names = FALSE)
+write.csv(year_counts, "year_counts.csv", row.names = FALSE)
+
+state_counts <- read.csv("state_counts.csv")
+
+kable(count(us_states_tweets, NAME), format = "latex", booktabs = TRUE, caption = "Tweet counts by state") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+kable(count(us_states_tweets, year), format = "latex", booktabs = TRUE, caption = "Tweet counts by state") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+
+
+
+```
+
+
+```{r, eval = FALSE}
+
+#this is for the paper to show distribution per state and distribution per year 
+
+#table 1
+state_counts <- count(us_states_tweets, NAME)
+state_counts <- st_drop_geometry(state_counts)
+write.csv(state_counts, "state_counts.csv", row.names = FALSE)
+
+half <- ceiling(nrow(state_counts) / 2)
+
+two_col_table <- bind_cols(
+  state_counts[1:half, ],
+  state_counts[(half + 1):nrow(state_counts), ]
+)
+
+latex_code <- kable(two_col_table, format = "latex", booktabs = TRUE, caption = "Data Distribution by State") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+cat(latex_code)
+
+
+
+# table 2
+
+year_counts <- count(us_states_tweets, year)
+year_counts <- st_drop_geometry(year_counts)
+write.csv(year_counts, "year_counts.csv", row.names = FALSE)
+
+latex_code <- kable(two_col_years, format = "latex", booktabs = TRUE, caption = "Data Distribution by State") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+cat(latex_code)
+
+
+
+half <- ceiling(nrow(year_counts) / 2)
+
+df1 <- year_counts[1:half, ]
+df2 <- year_counts[(half + 1):nrow(year_counts), ]
+
+# Pad the shorter column
+max_len <- max(nrow(df1), nrow(df2))
+pad <- function(df) {
+  rbind(df, data.frame(year = rep(NA, max_len - nrow(df)), n = rep(NA, max_len - nrow(df))))
+}
+
+df1 <- pad(df1)
+df2 <- pad(df2)
+
+# Bind columns
+two_col_years <- bind_cols(df1, df2)
+colnames(two_col_years) <- c("Year 1", "Count 1", "Year 2", "Count 2")
+
+
+```
+
+```{r}
+
+#this is to generate an excel file showing the hurricanes I used
+
+write.csv(hurricane_impact_filtered, "8_hurricanes.csv", row.names = FALSE)
+write.csv(hurricane_impact_df, "16_hurricanes.csv", row.names = FALSE)
+
+
+```
+
+```{r}
+
+#this is with time fixed effects. this is to visualize why i DID NOT use time fixed effects
+
+
+activity_list_time <- c("six_hurricane_activity_means", "three_hurricane_activity_means", "one_hurricane_activity_means")
+
+feols_activity_means_time <- list()
+
+for (i in seq_along(activity_list_3)) {
+  df_name <-activity_list_time[i]
+  feols_activity_means_time[[i]] <- feols(count ~ post_treatment * treatment_group | hurricane_id + year, data = get(df_name))
+  
+print(summary(feols(count ~ post_treatment * treatment_group | hurricane_id, data = get(df_name))))
+}
+
+names(feols_activity_means_time) <- activity_list_time
+
+
+
+texreg(feols_activity_means_time, 
+       custom.model.names = c("6 Months", "3 Months", "1 Month"),
+      #custom.coef.names = c("Intercept", "Post Treatment", "Treatment Group", "Interaction"),
+       stars = c(0.01, 0.05, 0.1),  # Add significance stars
+       caption = "Regression Results: Activity Analysis",
+       caption.above = TRUE,  
+       file = "D:\\CSP\\LaTex Tables\\full_631_activity_time.tex")
+
+```
+
+
+
